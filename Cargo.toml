@@ -10,4 +10,4 @@ gimli = "0"
 anyhow = "1"
 memmap2 = "0"
 tabled = "0"
-owo-colors = "4"
+owo-colors = { version = "4", features = ["supports-colors"] }

@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use gimli::{DwarfSections, EndianSlice, LittleEndian, Reader, ReaderOffset, UnitOffset};
 use memmap2::Mmap;
 use object::{Object, ObjectSection, ObjectSymbol};
-use owo_colors::OwoColorize;
+use owo_colors::{OwoColorize, Stream};
 use std::{borrow::Cow, collections::HashMap, fs::File, path::PathBuf};
 use tabled::{settings::Style, Table, Tabled};
 
@@ -840,7 +840,11 @@ fn cmd_details(bin: &PathBuf, coroutines: &mut [Coroutine], name: &str) -> Resul
         .count();
 
     if match_idx.is_none() {
-        eprintln!("{} No coroutine found matching '{}'", "Error:".red(), name);
+        eprintln!(
+            "{} No coroutine found matching '{}'",
+            "Error:".if_supports_color(Stream::Stderr, |t| t.red()),
+            name
+        );
         eprintln!("\nAvailable coroutines:");
         for c in coroutines.iter() {
             let loc = c
@@ -855,7 +859,7 @@ fn cmd_details(bin: &PathBuf, coroutines: &mut [Coroutine], name: &str) -> Resul
     if match_count > 1 {
         eprintln!(
             "{} Multiple coroutines match '{}'. Please use location:",
-            "Error:".red(),
+            "Error:".if_supports_color(Stream::Stderr, |t| t.red()),
             name
         );
         for c in coroutines.iter().filter(|c| {
@@ -879,47 +883,103 @@ fn cmd_details(bin: &PathBuf, coroutines: &mut [Coroutine], name: &str) -> Resul
 
     let coro = &coroutines[idx];
 
-    println!("{}", "# Coroutine Details".bold());
+    println!(
+        "{}",
+        "# Coroutine Details".if_supports_color(Stream::Stdout, |t| t.bold())
+    );
     println!();
-    println!("{:<12} {}", "Name:".bold(), coro.display_name().green());
     println!(
         "{:<12} {}",
-        "Location:".bold(),
-        coro.location().unwrap_or_else(|| "?".to_string()).cyan()
+        "Name:".if_supports_color(Stream::Stdout, |t| t.bold()),
+        coro.display_name()
+            .if_supports_color(Stream::Stdout, |t| t.green())
     );
-    println!("{:<12} {}", "Linkage:".bold(), coro.linkage_name.dimmed());
+    println!(
+        "{:<12} {}",
+        "Location:".if_supports_color(Stream::Stdout, |t| t.bold()),
+        coro.location()
+            .unwrap_or_else(|| "?".to_string())
+            .if_supports_color(Stream::Stdout, |t| t.cyan())
+    );
+    println!(
+        "{:<12} {}",
+        "Linkage:".if_supports_color(Stream::Stdout, |t| t.bold()),
+        coro.linkage_name
+            .if_supports_color(Stream::Stdout, |t| t.dimmed())
+    );
 
     println!();
-    println!("{}", "## Functions".bold());
+    println!(
+        "{}",
+        "## Functions".if_supports_color(Stream::Stdout, |t| t.bold())
+    );
     println!();
 
     if let Some(ref ramp) = coro.ramp {
-        println!("{}", "Ramp (entry point):".yellow());
-        println!("  {:<10} 0x{:x}", "Address:".dimmed(), ramp.address);
-        println!("  {:<10} {} bytes", "Size:".dimmed(), ramp.size);
+        println!(
+            "{}",
+            "Ramp (entry point):".if_supports_color(Stream::Stdout, |t| t.yellow())
+        );
+        println!(
+            "  {:<10} 0x{:x}",
+            "Address:".if_supports_color(Stream::Stdout, |t| t.dimmed()),
+            ramp.address
+        );
+        println!(
+            "  {:<10} {} bytes",
+            "Size:".if_supports_color(Stream::Stdout, |t| t.dimmed()),
+            ramp.size
+        );
     }
 
     if let Some(ref resume) = coro.resume {
-        println!("{}", "Resume:".yellow());
-        println!("  {:<10} 0x{:x}", "Address:".dimmed(), resume.address);
-        println!("  {:<10} {} bytes", "Size:".dimmed(), resume.size);
+        println!(
+            "{}",
+            "Resume:".if_supports_color(Stream::Stdout, |t| t.yellow())
+        );
+        println!(
+            "  {:<10} 0x{:x}",
+            "Address:".if_supports_color(Stream::Stdout, |t| t.dimmed()),
+            resume.address
+        );
+        println!(
+            "  {:<10} {} bytes",
+            "Size:".if_supports_color(Stream::Stdout, |t| t.dimmed()),
+            resume.size
+        );
     }
 
     if let Some(ref destroy) = coro.destroy {
-        println!("{}", "Destroy:".yellow());
-        println!("  {:<10} 0x{:x}", "Address:".dimmed(), destroy.address);
-        println!("  {:<10} {} bytes", "Size:".dimmed(), destroy.size);
+        println!(
+            "{}",
+            "Destroy:".if_supports_color(Stream::Stdout, |t| t.yellow())
+        );
+        println!(
+            "  {:<10} 0x{:x}",
+            "Address:".if_supports_color(Stream::Stdout, |t| t.dimmed()),
+            destroy.address
+        );
+        println!(
+            "  {:<10} {} bytes",
+            "Size:".if_supports_color(Stream::Stdout, |t| t.dimmed()),
+            destroy.size
+        );
     }
 
     // Print frame structure
     if let Some(ref frame) = coro.frame {
         println!();
-        println!("{}", "## Frame Structure".bold());
+        println!(
+            "{}",
+            "## Frame Structure".if_supports_color(Stream::Stdout, |t| t.bold())
+        );
         println!();
         println!(
             "{} {} (total size: {} bytes)",
-            "struct".purple(),
-            frame.type_name.cyan(),
+            "struct".if_supports_color(Stream::Stdout, |t| t.purple()),
+            frame
+                .type_name
+                .if_supports_color(Stream::Stdout, |t| t.cyan()),
             frame.size
         );
         println!();
@@ -931,7 +991,10 @@ fn cmd_details(bin: &PathBuf, coroutines: &mut [Coroutine], name: &str) -> Resul
         println!("{}", table);
     } else {
         println!();
-        println!("{} Frame structure not found in DWARF", "Warning:".yellow());
+        println!(
+            "{} Frame structure not found in DWARF",
+            "Warning:".if_supports_color(Stream::Stdout, |t| t.yellow())
+        );
     }
 
     Ok(())
