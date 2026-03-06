@@ -1,8 +1,9 @@
-use anyhow::{Context, Result};
-use clap::Parser;
+use anyhow::{bail, Context, Result};
+use clap::{Parser, Subcommand};
 use gimli::{DwarfSections, EndianSlice, LittleEndian, Reader, UnitOffset};
 use memmap2::Mmap;
 use object::{Object, ObjectSection, ObjectSymbol};
+use owo_colors::OwoColorize;
 use std::{borrow::Cow, collections::HashMap, fs::File, path::PathBuf};
 use tabled::{settings::Style, Table, Tabled};
 
@@ -12,11 +13,22 @@ use tabled::{settings::Style, Table, Tabled};
 struct Args {
     /// Path to the compiled binary to analyze
     bin: PathBuf,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Show detailed information about a specific coroutine
+    Details {
+        /// Coroutine name or location (e.g., "coroFib10" or "async-bench.c++:253")
+        name: String,
+    },
 }
 
 /// Information about a coroutine function (ramp, resume, or destroy)
 #[derive(Debug, Clone)]
-#[expect(dead_code)]
 struct FunctionInfo {
     /// Address of the function in the binary
     address: u64,
@@ -79,6 +91,10 @@ impl Coroutine {
                 }
             })
             .unwrap_or_default()
+    }
+
+    fn matches(&self, query: &str) -> bool {
+        self.display_name() == query || self.source_location() == query
     }
 }
 
@@ -351,26 +367,24 @@ fn enrich_with_dwarf<R: Reader>(
     Ok(())
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
-
+/// Load binary and extract coroutines with DWARF info
+fn load_coroutines(bin: &PathBuf) -> Result<Vec<Coroutine>> {
     // Open and memory-map the binary
-    let file = File::open(&args.bin)
-        .with_context(|| format!("Failed to open binary: {}", args.bin.display()))?;
+    let file =
+        File::open(bin).with_context(|| format!("Failed to open binary: {}", bin.display()))?;
 
     let mmap = unsafe { Mmap::map(&file) }
-        .with_context(|| format!("Failed to memory-map binary: {}", args.bin.display()))?;
+        .with_context(|| format!("Failed to memory-map binary: {}", bin.display()))?;
 
     // Parse the binary
     let object = object::File::parse(&*mmap)
-        .with_context(|| format!("Failed to parse binary: {}", args.bin.display()))?;
+        .with_context(|| format!("Failed to parse binary: {}", bin.display()))?;
 
     // Find coroutines from symbol table
     let mut coroutines = find_coroutines(&object);
 
     if coroutines.is_empty() {
-        println!("No coroutines found in binary.");
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     // Load DWARF sections
@@ -381,10 +395,14 @@ fn main() -> Result<()> {
     let debug_info_data = load_section_fn(gimli::SectionId::DebugInfo)?;
     if debug_info_data.is_empty() {
         eprintln!(
-            "Warning: No DWARF debug information found in binary: {}",
-            args.bin.display()
+            "{} No DWARF debug information found in binary: {}",
+            "Warning:".yellow(),
+            bin.display()
         );
-        eprintln!("Hint: Compile with -g flag to include debug information");
+        eprintln!(
+            "{} Compile with -g flag to include debug information",
+            "Hint:".cyan()
+        );
     } else {
         // Create the DWARF context and enrich coroutines
         let dwarf_sections = DwarfSections::load(&load_section_fn)?;
@@ -392,11 +410,22 @@ fn main() -> Result<()> {
         enrich_with_dwarf(&mut coroutines, &dwarf)?;
     }
 
-    // Build table rows
-    let mut sorted_coros: Vec<_> = coroutines.values().collect();
-    sorted_coros.sort_by_key(|c| c.display_name());
+    let mut result: Vec<_> = coroutines.into_values().collect();
+    result.sort_by(|a, b| a.display_name().cmp(&b.display_name()));
+    Ok(result)
+}
 
-    let rows: Vec<CoroutineRow> = sorted_coros
+/// Print the list of coroutines
+fn cmd_list(coroutines: &[Coroutine]) {
+    if coroutines.is_empty() {
+        println!("No coroutines found in binary.");
+        return;
+    }
+
+    println!("{}", "# Coroutines".bold());
+    println!();
+
+    let rows: Vec<CoroutineRow> = coroutines
         .iter()
         .map(|coro| CoroutineRow {
             name: coro.display_name(),
@@ -406,6 +435,93 @@ fn main() -> Result<()> {
 
     let table = Table::new(rows).with(Style::sharp()).to_string();
     println!("{}", table);
+
+    println!();
+    println!(
+        "{} Use `{} <name|location>` to see coroutine details",
+        "Hint:".cyan(),
+        "details".green()
+    );
+}
+
+/// Print details for a specific coroutine
+fn cmd_details(coroutines: &[Coroutine], query: &str) -> Result<()> {
+    let matches: Vec<_> = coroutines.iter().filter(|c| c.matches(query)).collect();
+
+    if matches.is_empty() {
+        eprintln!("{} No coroutine found matching '{}'", "Error:".red(), query);
+        eprintln!();
+        eprintln!("Available coroutines:");
+        for coro in coroutines {
+            eprintln!("  - {} ({})", coro.display_name(), coro.source_location());
+        }
+        bail!("Coroutine not found");
+    }
+
+    if matches.len() > 1 {
+        eprintln!(
+            "{} Multiple coroutines match '{}'. Use location to disambiguate:",
+            "Error:".red(),
+            query
+        );
+        eprintln!();
+        for coro in &matches {
+            eprintln!(
+                "  {} details {}",
+                "->".cyan(),
+                coro.source_location().green()
+            );
+        }
+        bail!("Ambiguous coroutine name");
+    }
+
+    let coro = matches[0];
+
+    println!("{}", "# Coroutine Details".bold());
+    println!();
+
+    println!("{:<12} {}", "Name:".bold(), coro.display_name().green());
+    println!(
+        "{:<12} {}",
+        "Location:".bold(),
+        coro.source_location().cyan()
+    );
+    println!("{:<12} {}", "Linkage:".bold(), coro.linkage_name.dimmed());
+
+    println!();
+    println!("{}", "## Functions".bold());
+    println!();
+
+    if let Some(ref ramp) = coro.ramp {
+        println!("{}", "Ramp (entry point):".yellow());
+        println!("  {:<10} 0x{:x}", "Address:".dimmed(), ramp.address);
+        println!("  {:<10} {} bytes", "Size:".dimmed(), ramp.size);
+    }
+
+    if let Some(ref resume) = coro.resume {
+        println!("{}", "Resume:".yellow());
+        println!("  {:<10} 0x{:x}", "Address:".dimmed(), resume.address);
+        println!("  {:<10} {} bytes", "Size:".dimmed(), resume.size);
+    }
+
+    if let Some(ref destroy) = coro.destroy {
+        println!("{}", "Destroy:".yellow());
+        println!("  {:<10} 0x{:x}", "Address:".dimmed(), destroy.address);
+        println!("  {:<10} {} bytes", "Size:".dimmed(), destroy.size);
+    }
+
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+
+    let coroutines = load_coroutines(&args.bin)?;
+
+    match args.command {
+        None => cmd_list(&coroutines),
+        Some(Command::Details { name }) => cmd_details(&coroutines, &name)?,
+    }
 
     Ok(())
 }
