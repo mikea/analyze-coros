@@ -116,26 +116,44 @@ struct DwarfFunctionInfo {
     line: Option<u64>,
 }
 
+/// Type definition info: (unit_index, offset, size)
+type TypeDefInfo = (usize, u64, Option<u64>);
+
 /// DWARF analyzer with cached type definitions
 struct DwarfAnalyzer<'a, R: Reader> {
     dwarf: &'a gimli::Dwarf<R>,
     units: Vec<gimli::Unit<R>>,
-    /// Map from type name to (unit_index, offset, size)
-    type_defs: HashMap<String, (usize, u64, Option<u64>)>,
+    /// Map from type name to (unit_index, offset, size) - lazily built
+    type_defs: Option<HashMap<String, TypeDefInfo>>,
 }
 
 impl<'a, R: Reader> DwarfAnalyzer<'a, R> {
     fn new(dwarf: &'a gimli::Dwarf<R>) -> Result<Self> {
         let mut units = Vec::new();
-        let mut type_defs = HashMap::new();
 
-        // Load all units and build type definition cache
+        // Load all units (but don't build type cache yet)
         let mut iter = dwarf.units();
-        let mut unit_index = 0;
         while let Some(header) = iter.next()? {
             let unit = dwarf.unit(header)?;
+            units.push(unit);
+        }
 
-            // Scan for type definitions
+        Ok(Self {
+            dwarf,
+            units,
+            type_defs: None,
+        })
+    }
+
+    /// Build the type definition cache (called lazily when needed)
+    fn ensure_type_cache(&mut self) -> Result<()> {
+        if self.type_defs.is_some() {
+            return Ok(());
+        }
+
+        let mut type_defs = HashMap::new();
+
+        for (unit_index, unit) in self.units.iter().enumerate() {
             let mut entries = unit.entries();
             while let Some(entry) = entries.next_dfs()? {
                 if entry.tag() == gimli::DW_TAG_structure_type
@@ -152,29 +170,26 @@ impl<'a, R: Reader> DwarfAnalyzer<'a, R> {
                         continue;
                     }
 
-                    if let Some(name_attr) = entry.attr(gimli::DW_AT_name) {
-                        if let Ok(name) = dwarf.attr_string(&unit, name_attr.value()) {
-                            if let Ok(name_str) = name.to_string_lossy() {
-                                let size = entry
-                                    .attr(gimli::DW_AT_byte_size)
-                                    .and_then(|a| a.udata_value());
-                                let offset: u64 = entry.offset().0.into_u64();
-                                type_defs.insert(name_str.into_owned(), (unit_index, offset, size));
-                            }
-                        }
+                    if let Some(name_attr) = entry.attr(gimli::DW_AT_name)
+                        && let Ok(name) = self.dwarf.attr_string(unit, name_attr.value())
+                        && let Ok(name_str) = name.to_string_lossy()
+                    {
+                        let size = entry
+                            .attr(gimli::DW_AT_byte_size)
+                            .and_then(|a| a.udata_value());
+                        let offset: u64 = entry.offset().0.into_u64();
+                        type_defs.insert(name_str.into_owned(), (unit_index, offset, size));
                     }
                 }
             }
-
-            units.push(unit);
-            unit_index += 1;
         }
 
-        Ok(Self {
-            dwarf,
-            units,
-            type_defs,
-        })
+        self.type_defs = Some(type_defs);
+        Ok(())
+    }
+
+    fn get_type_def(&self, name: &str) -> Option<&TypeDefInfo> {
+        self.type_defs.as_ref().and_then(|cache| cache.get(name))
     }
 
     fn get_type_size(
@@ -203,44 +218,36 @@ impl<'a, R: Reader> DwarfAnalyzer<'a, R> {
         }
 
         // Follow const/volatile/typedef to underlying type
-        if entry.tag() == gimli::DW_TAG_const_type
+        if (entry.tag() == gimli::DW_TAG_const_type
             || entry.tag() == gimli::DW_TAG_volatile_type
             || entry.tag() == gimli::DW_TAG_typedef
             || entry.tag() == gimli::DW_TAG_restrict_type
-            || entry.tag() == gimli::DW_TAG_atomic_type
+            || entry.tag() == gimli::DW_TAG_atomic_type)
+            && let Some(type_attr) = entry.attr(gimli::DW_AT_type)
+            && let gimli::AttributeValue::UnitRef(inner_offset) = type_attr.value()
         {
-            if let Some(type_attr) = entry.attr(gimli::DW_AT_type) {
-                if let gimli::AttributeValue::UnitRef(inner_offset) = type_attr.value() {
-                    return self.get_type_size(unit, inner_offset);
-                }
-            }
-            return None;
+            return self.get_type_size(unit, inner_offset);
         }
 
         // For array types with byte_size
-        if entry.tag() == gimli::DW_TAG_array_type {
-            if let Some(size) = entry
+        if entry.tag() == gimli::DW_TAG_array_type
+            && let Some(size) = entry
                 .attr(gimli::DW_AT_byte_size)
                 .and_then(|a| a.udata_value())
-            {
-                return Some(size);
-            }
+        {
+            return Some(size);
         }
 
         // Try cache lookup for struct/class types that are declarations
-        if entry.tag() == gimli::DW_TAG_structure_type
+        if (entry.tag() == gimli::DW_TAG_structure_type
             || entry.tag() == gimli::DW_TAG_class_type
-            || entry.tag() == gimli::DW_TAG_union_type
+            || entry.tag() == gimli::DW_TAG_union_type)
+            && let Some(name_attr) = entry.attr(gimli::DW_AT_name)
+            && let Ok(name) = self.dwarf.attr_string(unit, name_attr.value())
+            && let Ok(name_str) = name.to_string_lossy()
+            && let Some(&(_, _, Some(size))) = self.get_type_def(name_str.as_ref())
         {
-            if let Some(name_attr) = entry.attr(gimli::DW_AT_name) {
-                if let Ok(name) = self.dwarf.attr_string(unit, name_attr.value()) {
-                    if let Ok(name_str) = name.to_string_lossy() {
-                        if let Some(&(_, _, Some(size))) = self.type_defs.get(name_str.as_ref()) {
-                            return Some(size);
-                        }
-                    }
-                }
-            }
+            return Some(size);
         }
 
         None
@@ -256,46 +263,40 @@ impl<'a, R: Reader> DwarfAnalyzer<'a, R> {
         let entry = cursor.current()?;
 
         // Try to get name directly
-        if let Some(attr) = entry.attr(gimli::DW_AT_name) {
-            if let Ok(name) = self.dwarf.attr_string(unit, attr.value()) {
-                if let Ok(s) = name.to_string_lossy() {
-                    return Some(s.into_owned());
-                }
-            }
+        if let Some(attr) = entry.attr(gimli::DW_AT_name)
+            && let Ok(name) = self.dwarf.attr_string(unit, attr.value())
+            && let Ok(s) = name.to_string_lossy()
+        {
+            return Some(s.into_owned());
         }
 
         // For pointer types
         if entry.tag() == gimli::DW_TAG_pointer_type {
-            if let Some(type_attr) = entry.attr(gimli::DW_AT_type) {
-                if let gimli::AttributeValue::UnitRef(inner_offset) = type_attr.value() {
-                    if let Some(base_name) = self.get_type_name(unit, inner_offset) {
-                        return Some(format!("{} *", base_name));
-                    }
-                }
+            if let Some(type_attr) = entry.attr(gimli::DW_AT_type)
+                && let gimli::AttributeValue::UnitRef(inner_offset) = type_attr.value()
+                && let Some(base_name) = self.get_type_name(unit, inner_offset)
+            {
+                return Some(format!("{} *", base_name));
             }
             return Some("void *".to_string());
         }
 
         // For const types
-        if entry.tag() == gimli::DW_TAG_const_type {
-            if let Some(type_attr) = entry.attr(gimli::DW_AT_type) {
-                if let gimli::AttributeValue::UnitRef(inner_offset) = type_attr.value() {
-                    if let Some(base_name) = self.get_type_name(unit, inner_offset) {
-                        return Some(format!("const {}", base_name));
-                    }
-                }
-            }
+        if entry.tag() == gimli::DW_TAG_const_type
+            && let Some(type_attr) = entry.attr(gimli::DW_AT_type)
+            && let gimli::AttributeValue::UnitRef(inner_offset) = type_attr.value()
+            && let Some(base_name) = self.get_type_name(unit, inner_offset)
+        {
+            return Some(format!("const {}", base_name));
         }
 
         // For typedef
-        if entry.tag() == gimli::DW_TAG_typedef {
-            if let Some(attr) = entry.attr(gimli::DW_AT_name) {
-                if let Ok(name) = self.dwarf.attr_string(unit, attr.value()) {
-                    if let Ok(s) = name.to_string_lossy() {
-                        return Some(s.into_owned());
-                    }
-                }
-            }
+        if entry.tag() == gimli::DW_TAG_typedef
+            && let Some(attr) = entry.attr(gimli::DW_AT_name)
+            && let Ok(name) = self.dwarf.attr_string(unit, attr.value())
+            && let Ok(s) = name.to_string_lossy()
+        {
+            return Some(s.into_owned());
         }
 
         None
@@ -322,17 +323,13 @@ impl<'a, R: Reader> DwarfAnalyzer<'a, R> {
 
             if is_declaration {
                 // Look up definition in cache by name
-                if let Some(name_attr) = entry.attr(gimli::DW_AT_name) {
-                    if let Ok(name) = self.dwarf.attr_string(unit, name_attr.value()) {
-                        if let Ok(name_str) = name.to_string_lossy() {
-                            if let Some(&(unit_idx, offset, _)) =
-                                self.type_defs.get(name_str.as_ref())
-                            {
-                                let offset = UnitOffset(R::Offset::from_u64(offset).ok()?);
-                                return Some((unit_idx, offset));
-                            }
-                        }
-                    }
+                if let Some(name_attr) = entry.attr(gimli::DW_AT_name)
+                    && let Ok(name) = self.dwarf.attr_string(unit, name_attr.value())
+                    && let Ok(name_str) = name.to_string_lossy()
+                    && let Some(&(unit_idx, offset, _)) = self.get_type_def(name_str.as_ref())
+                {
+                    let offset = UnitOffset(R::Offset::from_u64(offset).ok()?);
+                    return Some((unit_idx, offset));
                 }
                 return None;
             }
@@ -346,17 +343,15 @@ impl<'a, R: Reader> DwarfAnalyzer<'a, R> {
         }
 
         // Follow const/volatile/typedef
-        if entry.tag() == gimli::DW_TAG_const_type
+        if (entry.tag() == gimli::DW_TAG_const_type
             || entry.tag() == gimli::DW_TAG_volatile_type
             || entry.tag() == gimli::DW_TAG_typedef
             || entry.tag() == gimli::DW_TAG_restrict_type
-            || entry.tag() == gimli::DW_TAG_atomic_type
+            || entry.tag() == gimli::DW_TAG_atomic_type)
+            && let Some(type_attr) = entry.attr(gimli::DW_AT_type)
+            && let gimli::AttributeValue::UnitRef(inner_offset) = type_attr.value()
         {
-            if let Some(type_attr) = entry.attr(gimli::DW_AT_type) {
-                if let gimli::AttributeValue::UnitRef(inner_offset) = type_attr.value() {
-                    return self.get_struct_info(unit, inner_offset);
-                }
-            }
+            return self.get_struct_info(unit, inner_offset);
         }
 
         None
@@ -486,32 +481,31 @@ impl<'a, R: Reader> DwarfAnalyzer<'a, R> {
         }
     }
 
-    fn extract_frame_info(&self, frame_type_name: &str) -> Result<Option<FrameInfo>> {
+    fn extract_frame_info(&mut self, frame_type_name: &str) -> Result<Option<FrameInfo>> {
+        // Build type cache for nested struct lookups
+        self.ensure_type_cache()?;
+
         for (unit_idx, unit) in self.units.iter().enumerate() {
             let mut entries = unit.entries();
             while let Some(entry) = entries.next_dfs()? {
-                if entry.tag() == gimli::DW_TAG_structure_type {
-                    if let Some(name_attr) = entry.attr(gimli::DW_AT_name) {
-                        if let Ok(name) = self.dwarf.attr_string(unit, name_attr.value()) {
-                            if let Ok(name_str) = name.to_string_lossy() {
-                                if name_str == frame_type_name {
-                                    let size = entry
-                                        .attr(gimli::DW_AT_byte_size)
-                                        .and_then(|a| a.udata_value())
-                                        .unwrap_or(0);
+                if entry.tag() == gimli::DW_TAG_structure_type
+                    && let Some(name_attr) = entry.attr(gimli::DW_AT_name)
+                    && let Ok(name) = self.dwarf.attr_string(unit, name_attr.value())
+                    && let Ok(name_str) = name.to_string_lossy()
+                    && name_str == frame_type_name
+                {
+                    let size = entry
+                        .attr(gimli::DW_AT_byte_size)
+                        .and_then(|a| a.udata_value())
+                        .unwrap_or(0);
 
-                                    let members =
-                                        self.extract_members(unit_idx, entry.offset(), 0)?;
+                    let members = self.extract_members(unit_idx, entry.offset(), 0)?;
 
-                                    return Ok(Some(FrameInfo {
-                                        type_name: name_str.into_owned(),
-                                        size,
-                                        members,
-                                    }));
-                                }
-                            }
-                        }
-                    }
+                    return Ok(Some(FrameInfo {
+                        type_name: name_str.into_owned(),
+                        size,
+                        members,
+                    }));
                 }
             }
         }
@@ -555,7 +549,10 @@ impl<'a, R: Reader> DwarfAnalyzer<'a, R> {
         Some((file, line))
     }
 
-    fn enrich_coroutines(&self, coroutines: &mut HashMap<String, Coroutine>) -> Result<()> {
+    /// Enrich coroutines with function names, locations, and frame sizes (fast)
+    fn enrich_coroutines(&mut self, coroutines: &mut HashMap<String, Coroutine>) -> Result<()> {
+        // Build type cache for frame size lookups (single pass through all DWARF entries)
+        self.ensure_type_cache()?;
         // Build address -> function info map
         let mut addr_info: HashMap<u64, DwarfFunctionInfo> = HashMap::new();
 
@@ -601,12 +598,11 @@ impl<'a, R: Reader> DwarfAnalyzer<'a, R> {
                         };
 
                         // Get name
-                        if let Some(attr) = entry.attr(gimli::DW_AT_name) {
-                            if let Ok(name) = self.dwarf.attr_string(unit, attr.value()) {
-                                if let Ok(s) = name.to_string_lossy() {
-                                    info.name = Some(s.into_owned());
-                                }
-                            }
+                        if let Some(attr) = entry.attr(gimli::DW_AT_name)
+                            && let Ok(name) = self.dwarf.attr_string(unit, attr.value())
+                            && let Ok(s) = name.to_string_lossy()
+                        {
+                            info.name = Some(s.into_owned());
                         }
 
                         // Get location
@@ -615,24 +611,19 @@ impl<'a, R: Reader> DwarfAnalyzer<'a, R> {
                             info.line = Some(line);
                         }
 
-                        // Follow specification for lambdas
-                        if info.file.is_none() || info.line.is_none() {
-                            if let Some(spec_attr) = entry.attr(gimli::DW_AT_specification) {
-                                if let gimli::AttributeValue::UnitRef(spec_offset) =
-                                    spec_attr.value()
-                                {
-                                    if let Some(spec_info) = die_cache.get(&spec_offset) {
-                                        if info.name.is_none() {
-                                            info.name = spec_info.name.clone();
-                                        }
-                                        if info.file.is_none() {
-                                            info.file = spec_info.file.clone();
-                                        }
-                                        if info.line.is_none() {
-                                            info.line = spec_info.line;
-                                        }
-                                    }
-                                }
+                        // Follow specification for class methods (name/file/line may be on declaration)
+                        if let Some(spec_attr) = entry.attr(gimli::DW_AT_specification)
+                            && let gimli::AttributeValue::UnitRef(spec_offset) = spec_attr.value()
+                            && let Some(spec_info) = die_cache.get(&spec_offset)
+                        {
+                            if info.name.is_none() {
+                                info.name = spec_info.name.clone();
+                            }
+                            if info.file.is_none() {
+                                info.file = spec_info.file.clone();
+                            }
+                            if info.line.is_none() {
+                                info.line = spec_info.line;
                             }
                         }
 
@@ -642,43 +633,56 @@ impl<'a, R: Reader> DwarfAnalyzer<'a, R> {
             }
         }
 
-        // Enrich coroutines
+        // Enrich coroutines with function info and frame sizes
         for coro in coroutines.values_mut() {
-            if let Some(ref mut ramp) = coro.ramp {
-                if let Some(info) = addr_info.get(&ramp.address) {
-                    ramp.demangled_name = info.name.clone();
-                    ramp.file = info.file.clone();
-                    ramp.line = info.line;
-                }
+            if let Some(ref mut ramp) = coro.ramp
+                && let Some(info) = addr_info.get(&ramp.address)
+            {
+                ramp.demangled_name = info.name.clone();
+                ramp.file = info.file.clone();
+                ramp.line = info.line;
             }
-            if let Some(ref mut resume) = coro.resume {
-                if let Some(info) = addr_info.get(&resume.address) {
-                    resume.demangled_name = info.name.clone();
-                    resume.file = info.file.clone();
-                    resume.line = info.line;
-                }
+            if let Some(ref mut resume) = coro.resume
+                && let Some(info) = addr_info.get(&resume.address)
+            {
+                resume.demangled_name = info.name.clone();
+                resume.file = info.file.clone();
+                resume.line = info.line;
             }
-            if let Some(ref mut destroy) = coro.destroy {
-                if let Some(info) = addr_info.get(&destroy.address) {
-                    destroy.demangled_name = info.name.clone();
-                    destroy.file = info.file.clone();
-                    destroy.line = info.line;
-                }
+            if let Some(ref mut destroy) = coro.destroy
+                && let Some(info) = addr_info.get(&destroy.address)
+            {
+                destroy.demangled_name = info.name.clone();
+                destroy.file = info.file.clone();
+                destroy.line = info.line;
             }
 
-            // Extract frame info
+            // Frame size lookup from type cache (no member extraction)
             let frame_type_name = coro.frame_type_name();
-            if let Ok(Some(frame)) = self.extract_frame_info(&frame_type_name) {
-                coro.frame = Some(frame);
+            if let Some(&(_, _, Some(size))) = self.get_type_def(&frame_type_name) {
+                coro.frame = Some(FrameInfo {
+                    type_name: frame_type_name,
+                    size,
+                    members: Vec::new(), // Members not extracted yet
+                });
             }
         }
 
         Ok(())
     }
+
+    /// Extract frame info for a single coroutine
+    fn extract_frame_for(&mut self, coro: &mut Coroutine) -> Result<()> {
+        let frame_type_name = coro.frame_type_name();
+        if let Ok(Some(frame)) = self.extract_frame_info(&frame_type_name) {
+            coro.frame = Some(frame);
+        }
+        Ok(())
+    }
 }
 
 /// Find coroutines by scanning symbol table
-fn find_coroutines<'a>(object: &'a object::File) -> HashMap<String, Coroutine> {
+fn find_coroutines(object: &object::File) -> HashMap<String, Coroutine> {
     let mut coroutines: HashMap<String, Coroutine> = HashMap::new();
 
     for symbol in object.symbols() {
@@ -731,7 +735,7 @@ fn find_coroutines<'a>(object: &'a object::File) -> HashMap<String, Coroutine> {
     coroutines
 }
 
-/// Load binary and extract coroutines with DWARF info
+/// Load binary and extract coroutines with DWARF info (without frame details)
 fn load_coroutines(bin: &PathBuf) -> Result<Vec<Coroutine>> {
     let file =
         File::open(bin).with_context(|| format!("Failed to open binary: {}", bin.display()))?;
@@ -754,13 +758,40 @@ fn load_coroutines(bin: &PathBuf) -> Result<Vec<Coroutine>> {
     let dwarf_sections = DwarfSections::load(load_section)?;
     let dwarf = dwarf_sections.borrow(|section| EndianSlice::new(section, LittleEndian));
 
-    let analyzer = DwarfAnalyzer::new(&dwarf)?;
+    let mut analyzer = DwarfAnalyzer::new(&dwarf)?;
     analyzer.enrich_coroutines(&mut coroutines)?;
 
     let mut result: Vec<_> = coroutines.into_values().collect();
     result.sort_by(|a, b| a.display_name().cmp(b.display_name()));
 
     Ok(result)
+}
+
+/// Load a specific coroutine with full frame details
+fn load_coroutine_with_frame(bin: &PathBuf, coro: &mut Coroutine) -> Result<()> {
+    let file =
+        File::open(bin).with_context(|| format!("Failed to open binary: {}", bin.display()))?;
+    let mmap = unsafe { Mmap::map(&file) }
+        .with_context(|| format!("Failed to memory-map binary: {}", bin.display()))?;
+    let object = object::File::parse(&*mmap)
+        .with_context(|| format!("Failed to parse binary: {}", bin.display()))?;
+
+    // Load DWARF sections
+    let load_section = |id: gimli::SectionId| -> Result<Cow<'_, [u8]>> {
+        Ok(object
+            .section_by_name(id.name())
+            .map(|s| s.data().unwrap_or(&[]))
+            .map(Cow::Borrowed)
+            .unwrap_or(Cow::Borrowed(&[])))
+    };
+
+    let dwarf_sections = DwarfSections::load(load_section)?;
+    let dwarf = dwarf_sections.borrow(|section| EndianSlice::new(section, LittleEndian));
+
+    let mut analyzer = DwarfAnalyzer::new(&dwarf)?;
+    analyzer.extract_frame_for(coro)?;
+
+    Ok(())
 }
 
 // ============================================================================
@@ -794,20 +825,24 @@ fn cmd_list(coroutines: &[Coroutine]) {
     println!("{}", table);
 }
 
-fn cmd_details(coroutines: &[Coroutine], name: &str) -> Result<()> {
-    let matches: Vec<_> = coroutines
+fn cmd_details(bin: &PathBuf, coroutines: &mut [Coroutine], name: &str) -> Result<()> {
+    let match_idx = coroutines.iter().position(|c| {
+        c.display_name() == name || c.linkage_name == name || c.location().as_deref() == Some(name)
+    });
+
+    let match_count = coroutines
         .iter()
         .filter(|c| {
             c.display_name() == name
                 || c.linkage_name == name
                 || c.location().as_deref() == Some(name)
         })
-        .collect();
+        .count();
 
-    if matches.is_empty() {
+    if match_idx.is_none() {
         eprintln!("{} No coroutine found matching '{}'", "Error:".red(), name);
         eprintln!("\nAvailable coroutines:");
-        for c in coroutines {
+        for c in coroutines.iter() {
             let loc = c
                 .location()
                 .map(|l| format!(" ({})", l))
@@ -817,13 +852,17 @@ fn cmd_details(coroutines: &[Coroutine], name: &str) -> Result<()> {
         bail!("Coroutine not found");
     }
 
-    if matches.len() > 1 {
+    if match_count > 1 {
         eprintln!(
             "{} Multiple coroutines match '{}'. Please use location:",
             "Error:".red(),
             name
         );
-        for c in &matches {
+        for c in coroutines.iter().filter(|c| {
+            c.display_name() == name
+                || c.linkage_name == name
+                || c.location().as_deref() == Some(name)
+        }) {
             let loc = c
                 .location()
                 .map(|l| format!(" ({})", l))
@@ -833,7 +872,12 @@ fn cmd_details(coroutines: &[Coroutine], name: &str) -> Result<()> {
         bail!("Ambiguous coroutine name");
     }
 
-    let coro = matches[0];
+    let idx = match_idx.unwrap();
+
+    // Load frame info for this specific coroutine
+    load_coroutine_with_frame(bin, &mut coroutines[idx])?;
+
+    let coro = &coroutines[idx];
 
     println!("{}", "# Coroutine Details".bold());
     println!();
@@ -941,11 +985,11 @@ fn collect_frame_rows(
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let coroutines = load_coroutines(&args.bin)?;
+    let mut coroutines = load_coroutines(&args.bin)?;
 
     match args.command {
         None => cmd_list(&coroutines),
-        Some(Command::Details { name }) => cmd_details(&coroutines, &name)?,
+        Some(Command::Details { name }) => cmd_details(&args.bin, &mut coroutines, &name)?,
     }
 
     Ok(())
