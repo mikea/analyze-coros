@@ -42,6 +42,24 @@ struct FunctionInfo {
     line: Option<u64>,
 }
 
+/// A member of the coroutine frame structure
+#[derive(Debug, Clone)]
+struct FrameMember {
+    name: String,
+    type_name: String,
+    offset: u64,
+    size: Option<u64>,
+    is_artificial: bool,
+}
+
+/// The coroutine frame structure
+#[derive(Debug, Clone)]
+struct FrameInfo {
+    type_name: String,
+    size: u64,
+    members: Vec<FrameMember>,
+}
+
 /// A C++ coroutine with its three component functions
 #[derive(Debug)]
 struct Coroutine {
@@ -53,6 +71,8 @@ struct Coroutine {
     resume: Option<FunctionInfo>,
     /// The destroy function (called to destroy the coroutine frame)
     destroy: Option<FunctionInfo>,
+    /// The coroutine frame structure
+    frame: Option<FrameInfo>,
 }
 
 impl Coroutine {
@@ -62,6 +82,7 @@ impl Coroutine {
             ramp: None,
             resume: None,
             destroy: None,
+            frame: None,
         }
     }
 
@@ -96,6 +117,10 @@ impl Coroutine {
     fn matches(&self, query: &str) -> bool {
         self.display_name() == query || self.source_location() == query
     }
+
+    fn frame_type_name(&self) -> String {
+        format!("{}.coro_frame_ty", self.linkage_name)
+    }
 }
 
 /// Row for the coroutines table
@@ -105,6 +130,8 @@ struct CoroutineRow {
     name: String,
     #[tabled(rename = "Location")]
     location: String,
+    #[tabled(rename = "Frame Size (bytes)")]
+    frame_size: String,
 }
 
 /// DWARF info extracted from a subprogram entry
@@ -279,6 +306,241 @@ fn extract_file<R: Reader>(
     })
 }
 
+/// Get the size of a type from a type DIE offset
+fn get_type_size<R: Reader>(
+    unit: &gimli::Unit<R>,
+    type_offset: UnitOffset<R::Offset>,
+) -> Option<u64> {
+    let mut cursor = unit.entries_at_offset(type_offset).ok()?;
+    let _ = cursor.next_entry().ok()?;
+    let entry = cursor.current()?;
+
+    // Try to get size directly
+    if let Some(size) = entry
+        .attr(gimli::DW_AT_byte_size)
+        .and_then(|a| a.udata_value())
+    {
+        return Some(size);
+    }
+
+    // For pointer types, size is typically 8 bytes on 64-bit
+    if entry.tag() == gimli::DW_TAG_pointer_type {
+        return Some(8); // Assume 64-bit pointers
+    }
+
+    // For reference types, size is typically 8 bytes on 64-bit
+    if entry.tag() == gimli::DW_TAG_reference_type
+        || entry.tag() == gimli::DW_TAG_rvalue_reference_type
+    {
+        return Some(8);
+    }
+
+    // For const/volatile/typedef/restrict, follow the underlying type
+    if entry.tag() == gimli::DW_TAG_const_type
+        || entry.tag() == gimli::DW_TAG_volatile_type
+        || entry.tag() == gimli::DW_TAG_typedef
+        || entry.tag() == gimli::DW_TAG_restrict_type
+        || entry.tag() == gimli::DW_TAG_atomic_type
+    {
+        if let Some(type_attr) = entry.attr(gimli::DW_AT_type) {
+            if let gimli::AttributeValue::UnitRef(inner_offset) = type_attr.value() {
+                return get_type_size(unit, inner_offset);
+            }
+        }
+        // const void, etc. - no underlying type
+        return None;
+    }
+
+    // For array types, calculate size from element type and count
+    if entry.tag() == gimli::DW_TAG_array_type {
+        // Try to get byte_size directly first
+        if let Some(size) = entry
+            .attr(gimli::DW_AT_byte_size)
+            .and_then(|a| a.udata_value())
+        {
+            return Some(size);
+        }
+    }
+
+    // For structure/class/union types without byte_size, return None
+    // (they should have byte_size if complete)
+
+    None
+}
+
+/// Get the type name from a type DIE offset
+fn get_type_name<R: Reader>(
+    dwarf: &gimli::Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    type_offset: UnitOffset<R::Offset>,
+) -> Option<String> {
+    let mut cursor = unit.entries_at_offset(type_offset).ok()?;
+    let _ = cursor.next_entry().ok()?;
+    let entry = cursor.current()?;
+
+    // Try to get name directly
+    if let Some(attr) = entry.attr(gimli::DW_AT_name) {
+        if let Ok(name) = dwarf.attr_string(unit, attr.value()) {
+            if let Ok(s) = name.to_string_lossy() {
+                return Some(s.into_owned());
+            }
+        }
+    }
+
+    // For pointer types, get the base type and add *
+    if entry.tag() == gimli::DW_TAG_pointer_type {
+        if let Some(type_attr) = entry.attr(gimli::DW_AT_type) {
+            if let gimli::AttributeValue::UnitRef(inner_offset) = type_attr.value() {
+                if let Some(base_name) = get_type_name(dwarf, unit, inner_offset) {
+                    return Some(format!("{} *", base_name));
+                }
+            }
+        }
+        return Some("void *".to_string());
+    }
+
+    // For const types
+    if entry.tag() == gimli::DW_TAG_const_type {
+        if let Some(type_attr) = entry.attr(gimli::DW_AT_type) {
+            if let gimli::AttributeValue::UnitRef(inner_offset) = type_attr.value() {
+                if let Some(base_name) = get_type_name(dwarf, unit, inner_offset) {
+                    return Some(format!("const {}", base_name));
+                }
+            }
+        }
+    }
+
+    // For typedef
+    if entry.tag() == gimli::DW_TAG_typedef {
+        if let Some(attr) = entry.attr(gimli::DW_AT_name) {
+            if let Ok(name) = dwarf.attr_string(unit, attr.value()) {
+                if let Ok(s) = name.to_string_lossy() {
+                    return Some(s.into_owned());
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Extract frame structure from DWARF
+fn extract_frame_info<R: Reader>(
+    dwarf: &gimli::Dwarf<R>,
+    frame_type_name: &str,
+) -> Result<Option<FrameInfo>> {
+    let mut iter = dwarf.units();
+    while let Some(header) = iter.next()? {
+        let unit = dwarf.unit(header)?;
+
+        let mut entries = unit.entries();
+        while let Some(entry) = entries.next_dfs()? {
+            if entry.tag() == gimli::DW_TAG_structure_type {
+                // Check if this is our frame type
+                if let Some(name_attr) = entry.attr(gimli::DW_AT_name) {
+                    if let Ok(name) = dwarf.attr_string(&unit, name_attr.value()) {
+                        if let Ok(name_str) = name.to_string_lossy() {
+                            if name_str == frame_type_name {
+                                // Found the frame type, extract its info
+                                let size = entry
+                                    .attr(gimli::DW_AT_byte_size)
+                                    .and_then(|a| a.udata_value())
+                                    .unwrap_or(0);
+
+                                let members = extract_frame_members(dwarf, &unit, entry.offset())?;
+
+                                return Ok(Some(FrameInfo {
+                                    type_name: name_str.into_owned(),
+                                    size,
+                                    members,
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Extract members from a structure type
+fn extract_frame_members<R: Reader>(
+    dwarf: &gimli::Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    struct_offset: UnitOffset<R::Offset>,
+) -> Result<Vec<FrameMember>> {
+    let mut members = Vec::new();
+
+    let mut cursor = unit.entries_at_offset(struct_offset)?;
+    let _ = cursor.next_entry()?; // Move to the struct itself
+
+    // Iterate through children
+    while let Some(entry) = cursor.next_dfs()? {
+        // Check depth - we only want direct children (depth == 1)
+        if entry.depth <= 0 {
+            break; // Left the struct
+        }
+
+        if entry.tag() == gimli::DW_TAG_member && entry.depth == 1 {
+            let name = if let Some(attr) = entry.attr(gimli::DW_AT_name) {
+                dwarf
+                    .attr_string(unit, attr.value())
+                    .ok()
+                    .and_then(|s| s.to_string_lossy().ok().map(|c| c.into_owned()))
+                    .unwrap_or_else(|| "<anonymous>".to_string())
+            } else {
+                "<anonymous>".to_string()
+            };
+
+            let type_name = if let Some(attr) = entry.attr(gimli::DW_AT_type) {
+                if let gimli::AttributeValue::UnitRef(offset) = attr.value() {
+                    get_type_name(dwarf, unit, offset).unwrap_or_else(|| "<unknown>".to_string())
+                } else {
+                    "<unknown>".to_string()
+                }
+            } else {
+                "<unknown>".to_string()
+            };
+
+            let offset = entry
+                .attr(gimli::DW_AT_data_member_location)
+                .and_then(|a| a.udata_value())
+                .unwrap_or(0);
+
+            let is_artificial = entry
+                .attr(gimli::DW_AT_artificial)
+                .map(|a| matches!(a.value(), gimli::AttributeValue::Flag(true)))
+                .unwrap_or(false);
+
+            // Try to get size from the type
+            let size = if let Some(attr) = entry.attr(gimli::DW_AT_type) {
+                if let gimli::AttributeValue::UnitRef(type_offset) = attr.value() {
+                    get_type_size(unit, type_offset)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            members.push(FrameMember {
+                name,
+                type_name,
+                offset,
+                size,
+                is_artificial,
+            });
+        }
+    }
+
+    // Sort by offset
+    members.sort_by_key(|m| m.offset);
+
+    Ok(members)
+}
+
 /// Enrich coroutine data with DWARF debug information
 fn enrich_with_dwarf<R: Reader>(
     coroutines: &mut HashMap<String, Coroutine>,
@@ -362,6 +624,12 @@ fn enrich_with_dwarf<R: Reader>(
                 destroy.line = info.line;
             }
         }
+
+        // Extract frame info
+        let frame_type_name = coro.frame_type_name();
+        if let Ok(Some(frame)) = extract_frame_info(dwarf, &frame_type_name) {
+            coro.frame = Some(frame);
+        }
     }
 
     Ok(())
@@ -429,6 +697,11 @@ fn cmd_list(coroutines: &[Coroutine]) {
         .iter()
         .map(|coro| CoroutineRow {
             name: coro.display_name(),
+            frame_size: coro
+                .frame
+                .as_ref()
+                .map(|f| f.size.to_string())
+                .unwrap_or_else(|| "-".to_string()),
             location: coro.source_location(),
         })
         .collect();
@@ -508,6 +781,47 @@ fn cmd_details(coroutines: &[Coroutine], query: &str) -> Result<()> {
         println!("{}", "Destroy:".yellow());
         println!("  {:<10} 0x{:x}", "Address:".dimmed(), destroy.address);
         println!("  {:<10} {} bytes", "Size:".dimmed(), destroy.size);
+    }
+
+    // Print frame structure
+    if let Some(ref frame) = coro.frame {
+        println!();
+        println!("{}", "## Frame Structure".bold());
+        println!();
+        println!(
+            "{} {} (size: {})",
+            "struct".purple(),
+            frame.type_name.cyan(),
+            frame.size
+        );
+        println!("{{");
+
+        for member in &frame.members {
+            let size_str = member
+                .size
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "?".to_string());
+
+            let artificial_marker = if member.is_artificial {
+                " [artificial]"
+            } else {
+                ""
+            };
+
+            println!(
+                "  {:<40} {}; // size: {} offset: 0x{:x}{}",
+                member.type_name.blue(),
+                member.name.green(),
+                size_str,
+                member.offset,
+                artificial_marker.dimmed()
+            );
+        }
+
+        println!("}}");
+    } else {
+        println!();
+        println!("{} Frame structure not found in DWARF", "Warning:".yellow());
     }
 
     Ok(())
